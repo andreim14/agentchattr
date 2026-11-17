@@ -470,6 +470,42 @@ def _report_rule_sync(server_port: int, agent_name: str, epoch: int, token: str 
         pass
 
 
+def _wake_prompts(lines: list[str]) -> tuple[list[str], str]:
+    """Turn the queued trigger lines of one poll into (extra raw prompts, wake prompt).
+
+    Several triggers can land in one poll (mentions in two channels, a job and a
+    channel): wake once naming every channel/job, so none is silently dropped.
+    Custom prompts (slash commands, session prompts) are passed through verbatim.
+    """
+    channels, job_ids, customs = [], [], []
+    for line in lines:
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        raw_prompt = data.get("prompt", "")
+        if isinstance(raw_prompt, str) and raw_prompt.strip():
+            customs.append(raw_prompt.strip())
+        elif data.get("job_id") is not None:
+            if data["job_id"] not in job_ids:
+                job_ids.append(data["job_id"])
+        elif data.get("channel", "general") not in channels:
+            channels.append(data.get("channel", "general"))
+    targets = [f"#{c}" for c in channels] + [f"job_id={j}" for j in job_ids]
+    if not targets:
+        return customs[:-1], (customs[-1] if customs else "use mcp to read #general - you're mentioned, take appropriate action and respond")
+    if len(targets) == 1 and job_ids:
+        prompt = f"use mcp to read job_id={job_ids[0]} - you're mentioned in a job thread, take appropriate action and respond"
+    elif len(targets) == 1:
+        prompt = f"use mcp to read {targets[0]} - you're mentioned, take appropriate action and respond"
+    else:
+        prompt = (f"use mcp to read each of {', '.join(targets)} - you're mentioned in all of them; "
+                  "take appropriate action and reply in the same channel/job each request came from")
+    return customs, prompt
+
+
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
                    refresh_interval: int = 10):
@@ -505,30 +541,9 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         trigger_flag[0] = True
                     time.sleep(0.5)
 
-                    # Check if this is a job/activity-scoped trigger
-                    job_id = None
-                    custom_prompt = ""
-                    for line in lines:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            data = json.loads(line)
-                            if isinstance(data, dict) and "job_id" in data:
-                                job_id = data["job_id"]
-                            if isinstance(data, dict):
-                                raw_prompt = data.get("prompt", "")
-                                if isinstance(raw_prompt, str) and raw_prompt.strip():
-                                    custom_prompt = raw_prompt.strip()
-                        except json.JSONDecodeError:
-                            pass
-
-                    if custom_prompt:
-                        prompt = custom_prompt
-                    elif job_id:
-                        prompt = f"use mcp to read job_id={job_id} - you're mentioned in a job thread, take appropriate action and respond"
-                    else:
-                        prompt = f"use mcp to read #{channel} - you're mentioned, take appropriate action and respond"
+                    extras, prompt = _wake_prompts(lines)
+                    for extra in extras:
+                        inject_fn(extra.replace("\n", " "))
 
                     # Use current identity (may have changed via rename)
                     current_name, _ = get_identity_fn()
